@@ -3,6 +3,9 @@ import numpy as np
 import pandas as pd
 import argparse
 from scipy.stats import norm
+from collections import Counter
+import itertools
+import random
 
 import torch
 from torch.nn.utils.rnn import pad_sequence
@@ -11,23 +14,84 @@ from torch.nn.utils.rnn import pad_sequence
 
 parser = argparse.ArgumentParser(description='Prepare data for discourse detection')
 
-parser.add_argument('--data_path', type=str, default='data/filtered_12cats_lemmas.pkl', help='file containing data')
-parser.add_argument('--emb_path', type=str, default='data/embeddings_dict', help='file containing the embeddings')
+parser.add_argument('--data_path', type=str, default='data/sample_df_all.pkl', help='file containing data')
+parser.add_argument('--emb_path', type=str, default='data/embeddings_dict_all', help='file containing the embeddings')
 parser.add_argument('--save_path', type=str, default='data/samples/', help='path to save results')
-parser.add_argument('--num_samples', type=int, default=4, help='number of created samples')
+parser.add_argument('--tr_samples', type=int, default=6, help='Number of training datasets created and used')
+parser.add_argument('--ts_samples', type=int, default=2, help='Number of test datasets created and used')
 parser.add_argument('--num_timepoints', type=int, default=100, help='number of timepoints in each sample')
 parser.add_argument('--min_docs', type=int, default=500, help='minimum number of documents in each datapoint')
 parser.add_argument('--max_docs', type=int, default=1500, help='maximum number of documents in each datapoint')
+parser.add_argument('--test_categories', type=list, default=['autot', 'musiikki', 'luonto', 'vaalit', 'taudit', 'työllisyys', 'jääkiekko', 'kulttuuri', 'rikokset', 'koulut', 'tulipalot', 'ruoat'], help='News categories used in the test data')
+parser.add_argument('--n_topics_tr', type=int, default=12, help='number of topics used in the training samples')
+parser.add_argument('--n_topics_ts', type=int, default=12, help='number of topics used in the test samples')
+
 
 args = parser.parse_args()
 print(args)
 
-# Load the dataset
+############Load data##############
+
+# Load the dataset with article ids and topics
 df = pd.read_pickle(args.data_path)
 
 # Load the embedding data in dictionary form
 with open(args.emb_path, 'rb') as handle:
     embeddings_dict = pickle.load(handle)
+
+
+######Split data based on topics#####
+
+# Create a list of all topics in the dataset
+subject_list = list(itertools.chain(*list(df['subjects'])))
+
+# Count the occurrence of each topic (number of articles with the topic)
+subject_count = Counter(subject_list)
+
+# Select categories for training and validation that are not in test categories and are not extremely rare
+tr_val_cats = [x[0] for x in subject_count.most_common() if x[1] > 8000 and x[0] not in args.test_categories]
+
+del subject_list
+del subject_count
+
+# Split dataset into 2 sets based on the given categories used in the test data
+# Train and validation datasets are sampled from articles that don't contain any of the test categories
+def split_dataset(df, cats):
+    
+    cat_set = set(cats)
+    is_cat = df['subjects'].apply(lambda x: (cat_set & set(x) == set()))
+    tr_val_data = df[is_cat].copy()
+    test_data = df[~is_cat].copy()
+    
+    return tr_val_data, test_data
+
+# Selects one category 'label' for each article
+def extract_categories(df, cats):
+    clusters = []
+    
+    for cat in cats:
+        is_cat = df['subjects'].apply(lambda x: (cat in x))
+        df_filtered = df[is_cat].copy()
+        df_filtered['category'] = cat
+        clusters.append(df_filtered)
+        
+    df_merged = pd.concat(clusters, ignore_index=True)
+    df_merged = df_merged.drop(columns=['subjects'])
+    
+    return df_merged
+
+
+# Split dataset into two parts so that articles in train and validation sets don't contain categories chosen for the test set
+tr_val_data, test_data = split_dataset(df, args.test_categories)
+
+# Select one "representative" category for each article 
+tr_val_df = extract_categories(tr_val_data, tr_val_cats)
+test_df = extract_categories(test_data, args.test_categories)
+
+del tr_val_data
+del test_data
+
+#############Sample datasets###################
 
 # Sampling patterns for the synthetic data
 def linear_pattern(n=1, start=0, stop=100, change_rate=1):
@@ -69,6 +133,7 @@ def bell_pattern(n=1, start=0, stop=100, change_rate=1, std=0):
     freq_rates = n + y * n * change_rate
     
     return freq_rates
+
 
 def sample_pattern(pattern, timeline=100, change_rate=0.01):
     sample = None
@@ -208,15 +273,21 @@ def sample_pattern(pattern, timeline=100, change_rate=0.01):
         
     return time_freqs, change_points.astype(int)
 
-def create_test_samples(df, n_samples=100, min_doc=50, max_doc=100, frac=0.99, timeline=100, change_rates=[0.5, 1]):
-    categories = df['category'].unique()
+# Creates the data samples
+def create_samples(df, d_type='train', n_samples=100, min_doc=50, max_doc=100, frac=0.99, timeline=100, change_rates=[0.5, 1]):
+
+    unique_categories = list(df['category'].unique())
+    
+    if d_type == 'test':
+        categories = random.sample(unique_categories, args.n_topics_ts)
+    elif d_type == 'train':
+        categories = random.sample(unique_categories, args.n_topics_tr)
+    else:
+        print("Select one of the following sample data types: 'test', 'train'")
     
     samples = []   # list article ids
     tracker = pd.DataFrame(columns=['category', 'pattern', 'pivots'])
-    # sample_pivots = []  # list of pivots index in timeline, need to map with ids
     patterns = ['up', 'down', 'up_down', 'down_up', 'spike_up', 'spike_down']
-    # events = np.random.choice(patterns, n_samples, p=[0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.4])
-    # patterns = ['spike_down']
     
     g = df.groupby(['category'])
     
@@ -235,7 +306,7 @@ def create_test_samples(df, n_samples=100, min_doc=50, max_doc=100, frac=0.99, t
                 freqs, _ = sample_pattern('stable', timeline=timeline, change_rate=change_rate)
         
             # get n_doc, which is random between min and max but not exceed the total docs in cluster
-            df_cat = g.get_group(c)[['id', 'category', 'body']]
+            df_cat = g.get_group(c)[['id', 'category']]
             df_len = len(df_cat)
             n_doc = np.random.randint(min_doc, max_doc)
             n_doc = min(n_doc, df_len)
@@ -307,14 +378,31 @@ def add_labels(test_samples, tracker_labels):
         
     return samples
 
-# Creates a dict based on the data sample where timepoints are keys and 
-# embeddings are the values
-def get_embeddings(data, emb_dict):
+# Creates the defined number of samples using categories based on the chosen type (train, validation, test)
+def get_samples(d_type, n_samples):
+    
+    if d_type == 'test':
+        df = test_df
+    else:
+        df = tr_val_df
+        
+    test_samples, tracker = create_samples(df, d_type=d_type, n_samples=n_samples, timeline=args.num_timepoints, min_doc=args.min_docs, max_doc=args.max_docs, frac=0.99, change_rates=[0.5, 1])
+    
+    tracker_labels = convert_pivots(tracker, args.num_timepoints)
+    
+    samples = add_labels(test_samples, tracker_labels)
+    
+    return samples, tracker_labels
+
+# Creates a dict based on the data sample where timepoints are keys and embeddings are the values
+def get_embeddings(d_type, n_samples):
+    
+    samples, tracker_labels = get_samples(d_type, n_samples)
     
     tensor_list = []
     label_list = []
     
-    for dataframe in data:
+    for dataframe in samples:
         
         df = dataframe.copy()
 
@@ -322,49 +410,62 @@ def get_embeddings(data, emb_dict):
         labels = {}
 
         for i, row in df.iterrows():
-            emb = emb_dict[row['id']]
-            timepoint = row['time']
-            label = row['label']
-            if timepoint in embeddings:
-                embeddings[timepoint] = np.vstack([embeddings[timepoint], emb])
-            else:
-                embeddings[timepoint] = emb
+            if row['id'] in embeddings_dict:
+                emb = embeddings_dict[row['id']]
+                timepoint = row['time']
+                label = row['label']
+                if timepoint in embeddings:
+                    embeddings[timepoint] = np.vstack([embeddings[timepoint], emb])
+                else:
+                    embeddings[timepoint] = emb
 
-            if timepoint not in labels:
-                labels[timepoint] = label
+                if timepoint not in labels:
+                    labels[timepoint] = label
            
         for t in range(len(embeddings)):
             tensor = torch.from_numpy(embeddings[t])
             tensor_list.append(tensor)
             label_list.append(labels[t])
+            
+    # Adds padding to tensors that have less documents than the maximum number of docs in timepoint
+    padded_data = pad_sequence(tensor_list)
         
-        
-    return tensor_list, torch.FloatTensor(label_list)
+    return padded_data, torch.FloatTensor(label_list), tracker_labels
 
+# Variable for recording the maximum amount of documents per timepoint for padding
+max_docs = 0
 
-# Creates a list of data samples and tracker that shows the discourse patterns
-test_samples, tracker = create_test_samples(df, n_samples=args.num_samples, timeline=args.num_timepoints, min_doc=args.min_docs, max_doc=args.max_docs, frac=0.99, change_rates=[0.5, 1])
+# Get test data
+ts_tensor, ts_labels, ts_tracker = get_embeddings('test', args.ts_samples)
 
-del df
+print("Test data shape", ts_tensor.shape)
 
-print(tracker)
+if ts_tensor.shape[0] > max_docs:
+    max_docs = ts_tensor.shape[0]
 
-# Uses the tracker to create the labels (stable/non-stable) for each timepoint in the samples
-tracker_labels = convert_pivots(tracker, args.num_timepoints)
+print(ts_tracker)
 
-# Adds the labels to the sample files
-samples = add_labels(test_samples, tracker_labels)
+ts_d = {'data': ts_tensor, 'labels': ts_labels}
+torch.save(ts_d, args.save_path + 'ts_data.pt')
 
-# Creates tensors and labels
-tensors, labels = get_embeddings(samples, embeddings_dict)
+del test_df
+del ts_tensor
+del ts_labels
+del ts_tracker
 
-# Adds padding to tensors that have less documents than the maximum number of docs in timepoint
-padded_data = pad_sequence(tensors)
+# Get training data
+tr_tensor, tr_labels, tr_tracker = get_embeddings('train', args.tr_samples)
 
-# Save the created samples and the tracker
-pickle.dump(samples, open(args.save_path + "samples_5.pkl", "wb"))
-pickle.dump(tracker_labels, open(args.save_path + "tracker_labels_5.pkl", "wb"))
+print("Training data shape", tr_tensor.shape)
+
+if tr_tensor.shape[0] > max_docs:
+    max_docs = tr_tensor.shape[0]
+
+print(tr_tracker)
+
+print("Max size: ", max_docs)
 
 # Save the tensor with the padded data and the labels
-d = {'data': padded_data, 'labels': labels}
-torch.save(d, args.save_path + 'tensors_5.pt')
+tr_d = {'data': tr_tensor, 'labels': tr_labels, 'max_size': max_docs}
+torch.save(tr_d, args.save_path + 'tr_data.pt')
+

@@ -16,66 +16,101 @@ print('Using {} device'.format(device))
 
 parser = argparse.ArgumentParser(description='NN For Discourse Detection')
 
-parser.add_argument('--data_path', type=str, default='data/samples/tensors_5.pt', help='file containing data')
-parser.add_argument('--res_path', type=str, default='results/results_dict_5.pkl', help='path to save results')
-parser.add_argument('--tr_size', type=float, default=0.8, help='defines the size of the training set')
+parser.add_argument('--data_path', type=str, default='data/samples/', help='file containing data')
+parser.add_argument('--res_path', type=str, default='results/results_dict_10.pkl', help='path to save results')
 parser.add_argument('--batch_size', type=int, default=100, help='defines batch size')
-parser.add_argument('--lr', type=float, default=0.2, help='defines the learning rate')
+parser.add_argument('--val_size', type=float, default=0.2, help='defines the size of the validation dataset (as portion of the training data)')
+parser.add_argument('--lr', type=float, default=0.1, help='defines the learning rate')
 parser.add_argument('--epochs', type=int, default=10, help='defines the number of epochs')
 parser.add_argument('--hidden_size', type=int, default=10, help='bLSTM hidden state size')
 parser.add_argument('--lstm_layers', type=int, default=2, help='number of bLSTM layers')
-parser.add_argument('--lstm_dropout', type=float, default=0, help='dropout probability for bLSTM')
+parser.add_argument('--emb_size', type=int, default=300, help='Size of the document embedding vector')
+parser.add_argument('--lstm_dropout', type=float, default=0.3, help='dropout probability for bLSTM')
 
 
 args = parser.parse_args()
 print(args)
 
-# Load the data dict 
-tensor_dict = torch.load(args.data_path)
 
+##############Load input data############
+
+# Load the training data 
+tr_dict = torch.load(args.data_path + "tr_data.pt")
 # Get input data and labels 
-data_tensor = tensor_dict['data']
-labels = tensor_dict['labels']
+data_tensor = tr_dict['data']
+labels = tr_dict['labels']
+# Get the maximum amount of documents per timepoint for padding
+max_docs = tr_dict['max_size']
 
-del tensor_dict
+del tr_dict
 
-# Split data into train and test sets so that the order of timepoints is preserved
-train_size = int(round(args.tr_size * len(labels), -2))
-test_size = len(labels) - train_size
+# Get the training and validation data and labels
+val_size = int(round(args.val_size * len(labels), -2))
+tr_size = len(labels) - val_size
 
-print('Train data size: ', train_size)
-print('Test data size: ', test_size)
+print('Validation data size: ', val_size)
+print('Train data size: ', tr_size)
 
-train_data = data_tensor[:,:train_size,:]
-train_labels = labels[:train_size]
+tr_data = data_tensor[:,:tr_size,:]
+tr_labels = labels[:tr_size]
 
-test_data = data_tensor[:,train_size:,:]
-test_labels = labels[train_size:]
+val_data = data_tensor[:,tr_size:,:]
+val_labels = labels[tr_size:]
+
+del data_tensor
+del labels
+
+# Load the test data 
+ts_dict = torch.load(args.data_path + "ts_data.pt")
+# Get input data and labels 
+ts_data = ts_dict['data']
+ts_labels = ts_dict['labels']
+
+print('Test data size: ', len(ts_labels))
+
+
+#########Initialize dataset and dataloader#######
 
 # Creates a pytorch dataset
 class EmbeddingsDataset(Dataset):
-    def __init__(self,x,y):
+    def __init__(self, x, y, max_docs):
         self.x = x
         self.y = y
         self.length = self.y.shape[0]
+        self.max_docs = max_docs
     
     def __getitem__(self,idx):
-        return self.x[:,idx,:], self.y[idx]
+        
+        timepoint = self.x[:,idx,:]
+        
+        # Adds padding if required
+        if timepoint.shape[0] < self.max_docs:
+            pad = self.max_docs - timepoint.shape[0]
+            timepoint = F.pad(input=timepoint, pad=(0, 0, 0, pad), mode='constant', value=0)
+            
+        return timepoint, self.y[idx]
     
     def __len__(self):
+        
         return self.length
 
-# Creates train and test datasets
-tr_data = EmbeddingsDataset(train_data, train_labels)
-ts_data = EmbeddingsDataset(test_data, test_labels)
 
-# Creates dataloaders for train and test data
-train_dataloader = DataLoader(tr_data, batch_size=args.batch_size, shuffle=True)
-test_dataloader = DataLoader(ts_data, batch_size=args.batch_size, shuffle=True)
+# Creates train, validation and test datasets
+train_data = EmbeddingsDataset(tr_data, tr_labels, max_docs)
+validation_data = EmbeddingsDataset(val_data, val_labels, max_docs)
+test_data = EmbeddingsDataset(ts_data, ts_labels, max_docs)
+
+# Creates dataloaders for train, validation and test data
+train_dataloader = DataLoader(train_data, batch_size=args.batch_size, shuffle=False)
+validation_dataloader = DataLoader(validation_data, batch_size=args.batch_size, shuffle=False)
+test_dataloader = DataLoader(test_data, batch_size=args.batch_size, shuffle=False)
 
 # Print the batch shape
 train_features, train_labels = next(iter(train_dataloader))
-print(f"Feature batch shape: {train_features.size()}")
+print(f"Train batch shape: {train_features.size()}")
+
+
+##############Define the network modules############
 
 # Define the MLP network class
 class MLP(nn.Module):
@@ -86,8 +121,9 @@ class MLP(nn.Module):
         self.flatten = nn.Flatten()
         self.fc1 = nn.Linear(input_size, 200*50)
         self.fc2 = nn.Linear(200*50, 200*20)
-        self.fc3 = nn.Linear(200*20, 50*10)
-        self.fc4 = nn.Linear(50*10, output_size)
+        self.fc3 = nn.Linear(200*20, 200*20)
+        self.fc4 = nn.Linear(200*20, 50*10)
+        self.fc5 = nn.Linear(50*10, output_size)
 
     def forward(self, x):
         # define forward pass
@@ -96,6 +132,7 @@ class MLP(nn.Module):
         x = F.relu(self.fc2(x))
         x = F.relu(self.fc3(x))
         x = F.relu(self.fc4(x))
+        x = F.relu(self.fc5(x))
         
         return x
 
@@ -106,7 +143,8 @@ class RNN(nn.Module):
 
         # define network layers    
         self.blstm = torch.nn.LSTM(input_size=input_size, hidden_size=hidden_size, num_layers=num_layers, dropout=args.lstm_dropout, bidirectional=True, batch_first=True)  
-        self.fc = nn.Linear(output_size, timepoints)
+        self.fc = nn.Linear(output_size, int(output_size/2))
+        self.fc2 = nn.Linear(int(output_size/2), timepoints)
         self.sigmoid = nn.Sigmoid()
         
     # Define forward pass
@@ -114,16 +152,18 @@ class RNN(nn.Module):
         # the first value returned by LSTM is all of the hidden states throughout the sequence
         x, _ = self.blstm(x)
         x = self.fc(x.flatten())
+        x = self.fc2(x)
         x = self.sigmoid(x)
         
         return x
 
+
 # Define input and output size for MLP
-mlp_input_size = data_tensor.size()[0]*data_tensor.size()[2]
+mlp_input_size = max_docs*args.emb_size
 mlp_output_size = 100
 
 # Define the output size for LSTM
-lstm_output_size = args.lstm_layers*args.batch_size*args.hidden_size
+lstm_output_size = 2*args.batch_size*args.hidden_size
 
 # Instantiate the models
 mlp = MLP(mlp_input_size, mlp_output_size).to(device)
@@ -137,6 +177,9 @@ print('RNN: ', rnn)
 optimizer = torch.optim.SGD(list(mlp.parameters()) + list(rnn.parameters()), lr=args.lr)
 criterion = nn.BCELoss()
 
+
+#######Define the train, validation and test iteration functions#######
+
 # Function for training the model
 def train_model():
     
@@ -145,6 +188,8 @@ def train_model():
     rnn.train()
     
     loss = 0
+
+    num_batches = len(train_dataloader)
     
     # Loop over train data batches
     for (x_train, y_train) in train_dataloader:
@@ -156,15 +201,15 @@ def train_model():
         # Calculate training loss
         tr_loss = criterion(rnn_output, y_train)
         loss += tr_loss.item()
-        
+
         # Backpropagate loss
         optimizer.zero_grad()
         tr_loss.backward()
         optimizer.step()
     
     # Calculate average loss for the epoch
-    train_loss = loss / len(train_dataloader)
-    
+    train_loss = loss / num_batches
+
     return train_loss
 
 # Function for evaluating the model
@@ -175,9 +220,48 @@ def eval_model():
     rnn.eval()
     
     loss = 0
-    accuracy = 0
+    correct = 0
+    
+    size = len(validation_dataloader.dataset)
+    num_batches = len(validation_dataloader)
     
     # Gradients are not calculated during evaluation
+    with torch.no_grad():
+        
+        # Loop over validation data batches
+        for (x_val, y_val) in validation_dataloader:
+            
+            # Calculate output for test data 
+            mlp_pred = mlp(x_val)
+            rnn_pred = rnn(mlp_pred.unsqueeze(0))
+        
+            # Calculate loss for test data
+            val_loss = criterion(rnn_pred, y_val)
+            loss += val_loss.item()
+            
+            # Calculate the number of correct predictions in batch  
+            correct += (torch.sum(torch.round(rnn_pred.reshape(-1).detach()) == y_val.detach())).item()
+        
+        # Calculate average loss and accuracy for the epoch
+        validation_loss = loss / num_batches
+        validation_accuracy = correct / size
+    
+    return validation_loss, validation_accuracy
+
+# Function for testing the model
+def test_model():
+    
+    # Set the networks to evaluation mode (dropout is not applied)
+    mlp.eval()
+    rnn.eval()
+    
+    loss = 0
+    correct = 0
+    
+    size = len(test_dataloader.dataset)
+    num_batches = len(test_dataloader)
+    
+    # Gradients are not calculated during testing
     with torch.no_grad():
         
         # Loop over test data batches
@@ -188,24 +272,25 @@ def eval_model():
             rnn_pred = rnn(mlp_pred.unsqueeze(0))
         
             # Calculate loss for test data
-            val_loss = criterion(rnn_pred, y_test)
-            loss += val_loss.item()
+            test_loss = criterion(rnn_pred, y_test)
+            loss += test_loss.item()
             
             # Calculate accuracy (portion of labels predicted correctly)
-            acc = (torch.sum(torch.round(rnn_pred.reshape(-1).detach()) == y_test.detach()) / len(y_test)).item()
-             
-            accuracy += acc
+            correct += (torch.sum(torch.round(rnn_pred.reshape(-1).detach()) == y_test.detach())).item()
         
         # Calculate average loss and accuracy for the epoch
-        validation_loss = loss / len(test_dataloader)
-        validation_accuracy = accuracy / len(test_dataloader)
-    
-    return validation_loss, validation_accuracy
+        test_loss = loss / num_batches
+        test_accuracy = correct / size
+        
+    return test_loss, test_accuracy
+
+
+#########Train the model##########
 
 # Save loss and accuracy for each epoch
 tr_losses = []
 val_losses = []
-accuracies = []
+val_accuracies = []
 
 # Calculate training and evaluation loss and accuracy for each epoch
 for epoch in range(1, args.epochs+1): 
@@ -213,13 +298,23 @@ for epoch in range(1, args.epochs+1):
     val_loss, accuracy = eval_model()
     tr_losses.append(tr_loss)
     val_losses.append(val_loss)
-    accuracies.append(accuracy)
+    val_accuracies.append(accuracy)
     
     print("|Epoch %d | Training loss : %.3f | Validation loss %.3f | Accuracy %.3f"%(epoch, tr_loss, val_loss, accuracy))
 
-print("Mean accuracy: %.3f"%np.mean(accuracies))
+print("Mean validation accuracy: %.3f" %np.mean(val_accuracies))
 
-results = {'tr_loss': tr_losses, 'val_loss': val_losses, 'accuracy': accuracies}
+
+##########Get the model accuracy for the test set#########
+
+test_loss, test_accuracy = test_model()
+
+print("Test loss : %.3f | Test accuracy %.3f" %(test_loss, test_accuracy))
+
+
+##########Save the results#################
+
+results = {'tr_loss': tr_losses, 'val_loss': val_losses, 'accuracy': val_accuracies}
 
 # Save loss and accuracy
 file_to_write = open(args.res_path, 'wb')
